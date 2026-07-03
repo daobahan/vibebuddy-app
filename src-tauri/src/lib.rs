@@ -257,12 +257,15 @@ pub fn run() {
             .initialization_script("window.__VB_DESKTOP__ = true;")
             .on_navigation(|url| {
                 let s = url.as_str();
-                let ours = s.starts_with("https://vibebuddy.io")
-                    || s.starts_with("https://staging.vibebuddy.io")
-                    || s.starts_with("tauri://")
-                    || s.starts_with("http://tauri.localhost");
+                // the sign-in handoff page must open in the user's real browser even though
+                // it lives on our own domain — their GitHub session lives out there
+                let is_link_handoff = s.contains("/link?code=");
+                let ours = !is_link_handoff
+                    && (s.starts_with("https://vibebuddy.io")
+                        || s.starts_with("https://staging.vibebuddy.io")
+                        || s.starts_with("tauri://")
+                        || s.starts_with("http://tauri.localhost"));
                 if !ours {
-                    // GitHub sign-in and friends belong in the user's real browser (their cookies live there)
                     open_in_system_browser(s);
                 }
                 ours
