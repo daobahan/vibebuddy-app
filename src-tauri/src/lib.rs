@@ -98,6 +98,21 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
+// username only — the bubble draws the account buddy with the same seed as the web
+#[tauri::command]
+fn get_account() -> serde_json::Value {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    let p = std::path::Path::new(&home).join(".vibebuddy").join("config.json");
+    if let Ok(s) = std::fs::read_to_string(p) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+            return serde_json::json!({ "username": v.get("username") });
+        }
+    }
+    serde_json::json!({ "username": null })
+}
+
 // native right-click menu on the bubble
 #[tauri::command]
 fn bubble_menu(app: AppHandle) {
@@ -179,7 +194,7 @@ fn handle_menu(app: &AppHandle, id: &str) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![toggle_panel, quit_app, bubble_menu])
+        .invoke_handler(tauri::generate_handler![toggle_panel, quit_app, bubble_menu, get_account])
         .on_menu_event(|app, event| handle_menu(app, event.id().as_ref()))
         .setup(|app| {
             // ---- the bubble ----
