@@ -1,0 +1,12 @@
+{
+  "identifier": "remote-panel",
+  "description": "let the vibebuddy.io panel drag and hide its own window",
+  "remote": {
+    "urls": ["https://vibebuddy.io", "https://vibebuddy.io/*", "https://staging.vibebuddy.io/*"]
+  },
+  "windows": ["panel"],
+  "permissions": [
+    "core:window:allow-start-dragging",
+    "core:window:allow-hide"
+  ]
+}
