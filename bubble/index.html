@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+    #bubble {
+      width: 64px; height: 64px; margin: 4px;
+      border-radius: 50%;
+      background: rgba(29, 29, 33, 0.94);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; user-select: none;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+    }
+    canvas { image-rendering: pixelated; width: 36px; height: 40px; }
+    #bubble:active { transform: scale(0.96); }
+    @keyframes bob { 50% { transform: translateY(-2px); } }
+    canvas { animation: bob 2.4s steps(2) infinite; }
+  </style>
+</head>
+<body>
+  <div id="bubble" title="vibebuddy — click to open">
+    <canvas id="pet" width="64" height="72"></canvas>
+  </div>
+  <script>
+    // procedural buddy — seed persisted per install
+    const PALETTES = [
+      ['#f5c4b3', '#d85a30'], ['#cecbf6', '#7f77dd'], ['#9fe1cb', '#1d9e75'],
+      ['#f4c0d1', '#d4537e'], ['#fac775', '#ba7517'], ['#b5d4f4', '#378add'],
+    ];
+    let seed = Number(localStorage.getItem('vb-seed'));
+    if (!seed) {
+      seed = (Math.random() * 4294967296) >>> 0;
+      localStorage.setItem('vb-seed', String(seed));
+    }
+    function mulberry32(a) {
+      return function () {
+        a |= 0; a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+    const rnd = mulberry32(seed);
+    const palette = PALETTES[Math.floor(rnd() * PALETTES.length)];
+    const g = Array.from({ length: 8 }, () => [0, 0, 0, 0, 0, 0, 0, 0]);
+    for (let y = 1; y < 7; y++) for (let x = 1; x < 4; x++) if (rnd() < 0.55) { g[y][x] = 1; g[y][7 - x] = 1; }
+    g[3][3] = 1; g[3][4] = 1;
+    for (let y = 1; y < 7; y++) for (let x = 1; x < 4; x++) if (g[y][x] === 1 && rnd() < 0.25) { g[y][x] = 2; g[y][7 - x] = 2; }
+    for (let y = 2; y < 6; y++) if (g[y][2] && g[y][5]) { g[y][2] = 3; g[y][5] = 3; break; }
+    const ctx = document.getElementById('pet').getContext('2d');
+    for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
+      const v = g[y][x]; if (!v) continue;
+      ctx.fillStyle = v === 1 ? palette[0] : v === 2 ? palette[1] : '#232326';
+      ctx.fillRect(x * 8, y * 8, 8, 8);
+    }
+
+    // click toggles the panel; drag moves the bubble (panel follows on next open)
+    const el = document.getElementById('bubble');
+    const invoke = window.__TAURI__.core.invoke;
+    const getWin = window.__TAURI__.window.getCurrentWindow;
+    let down = null, dragged = false;
+    el.addEventListener('pointerdown', (e) => { down = { x: e.screenX, y: e.screenY }; dragged = false; });
+    el.addEventListener('pointermove', (e) => {
+      if (down && !dragged && (Math.abs(e.screenX - down.x) > 6 || Math.abs(e.screenY - down.y) > 6)) {
+        dragged = true;
+        getWin().startDragging();
+      }
+    });
+    el.addEventListener('pointerup', () => {
+      if (down && !dragged) invoke('toggle_panel');
+      down = null;
+    });
+  </script>
+</body>
+</html>
