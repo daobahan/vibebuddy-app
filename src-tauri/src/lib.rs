@@ -193,6 +193,18 @@ fn config_token_server() -> Option<(String, String)> {
     ))
 }
 
+// codex installed after this machine was wired: its config exists but lacks our MCP bridge
+fn codex_unwired() -> bool {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    let toml = std::path::Path::new(&home).join(".codex").join("config.toml");
+    match std::fs::read_to_string(toml) {
+        Ok(s) => !s.contains("[mcp_servers.vibebuddy]"),
+        Err(_) => false, // no codex here — nothing to wire
+    }
+}
+
 // the whole dance: panel session cookie -> mint token -> npx init.
 // force = explicit user ask: rerun init even when wired (picks up newly installed
 // agents like a fresh codex, and refreshes hook templates after CLI updates).
@@ -516,6 +528,14 @@ pub fn run() {
                 let app = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_secs(6));
+                    // wired machine, late-arriving codex: one silent re-init writes its MCP bridge
+                    if machine_wired() && codex_unwired() {
+                        if let Some((token, server)) = config_token_server() {
+                            if run_npx_init(&token, &server).is_ok() {
+                                panel_toast(&app, "✓ codex wired up — restart codex and it counts");
+                            }
+                        }
+                    }
                     for _ in 0..24 {
                         if machine_wired() {
                             return;
