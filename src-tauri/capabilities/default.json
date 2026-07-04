@@ -5,9 +5,9 @@
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
-    "allow-toggle_panel",
-    "allow-bubble_menu",
-    "allow-get_account",
-    "allow-quit_app"
+    "allow-toggle-panel",
+    "allow-bubble-menu",
+    "allow-get-account",
+    "allow-quit-app"
   ]
 }

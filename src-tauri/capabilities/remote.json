@@ -8,6 +8,6 @@
   "permissions": [
     "core:window:allow-start-dragging",
     "core:window:allow-hide",
-    "allow-install_agent"
+    "allow-install-agent"
   ]
 }
