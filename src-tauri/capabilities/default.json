@@ -4,6 +4,10 @@
   "windows": ["bubble"],
   "permissions": [
     "core:default",
-    "core:window:allow-start-dragging"
+    "core:window:allow-start-dragging",
+    "allow-toggle_panel",
+    "allow-bubble_menu",
+    "allow-get_account",
+    "allow-quit_app"
   ]
 }

@@ -17,6 +17,7 @@ const MARGIN: i32 = 8;
 
 static FROSTED: AtomicBool = AtomicBool::new(true);
 static SOLIDITY: AtomicU32 = AtomicU32::new(86); // panel opaqueness %, adjustable from the bubble menu
+static CONNECTING: AtomicBool = AtomicBool::new(false); // one agent-install dance at a time
 
 fn open_in_system_browser(url: &str) {
     #[cfg(target_os = "windows")]
@@ -87,27 +88,71 @@ fn position_panel(app: &AppHandle) {
     let _ = panel.set_position(PhysicalPosition::new(x, y));
 }
 
-// spawn the CLI with a pre-authorized token — no browser dance, no terminal
-#[tauri::command]
-fn install_agent(token: String, server: String) -> Result<String, String> {
-    if !token.starts_with("vb_") || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err("bad token".into());
+// ---- wiring this machine's agents: connection is the core gameplay, it must not wait for a button ----
+
+fn vb_config_path() -> std::path::PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    std::path::Path::new(&home).join(".vibebuddy").join("config.json")
+}
+
+// wired = a config for OUR server with a token in it already lives on this machine
+fn machine_wired() -> bool {
+    let Ok(s) = std::fs::read_to_string(vb_config_path()) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return false;
+    };
+    v.get("server").and_then(|x| x.as_str()) == Some(SITE)
+        && v.get("token").and_then(|x| x.as_str()).is_some_and(|t| t.starts_with("vb_"))
+}
+
+fn no_window(cmd: &mut std::process::Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let server_ok = server == "https://vibebuddy.io"
-        || server == "https://staging.vibebuddy.io"
-        || server.starts_with("http://localhost")
-        || server.starts_with("http://127.0.0.1");
-    if !server_ok {
-        return Err("bad server".into());
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = cmd;
     }
+}
+
+// mint an agent token with the panel's own session — curl ships with every OS we target
+fn mint_token(sid: &str) -> Result<String, String> {
+    let mut c = std::process::Command::new("curl");
+    c.args([
+        "-s", "-m", "20", "-X", "POST",
+        "-H", "Content-Type: application/json",
+        "-d", r#"{"agent_kind":"machine"}"#,
+    ]);
+    c.arg("-H").arg(format!("Cookie: vb_sid={sid}"));
+    c.arg(format!("{SITE}/api/tokens"));
+    no_window(&mut c);
+    let out = c.output().map_err(|e| format!("could not run curl: {e}"))?;
+    let body = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(body.trim())
+        .map_err(|_| format!("token mint failed: {}", body.chars().take(120).collect::<String>()))?;
+    match v.get("token").and_then(|t| t.as_str()) {
+        Some(t) => Ok(t.to_string()),
+        None => Err(format!(
+            "token mint refused: {}",
+            v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error")
+        )),
+    }
+}
+
+fn run_npx_init(token: &str, server: &str) -> Result<String, String> {
     let output = {
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::process::CommandExt;
-            std::process::Command::new("cmd")
-                .args(["/C", "npx", "-y", "vibebuddy@latest", "init", "--token", &token, "--server", &server])
-                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-                .output()
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", "npx", "-y", "vibebuddy@latest", "init", "--token", token, "--server", server]);
+            no_window(&mut c);
+            c.output()
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -127,6 +172,63 @@ fn install_agent(token: String, server: String) -> Result<String, String> {
     } else {
         Err(text.chars().take(400).collect())
     }
+}
+
+// tell the panel something worth a toast (serde makes the JS string injection-proof)
+fn panel_toast(app: &AppHandle, msg: &str) {
+    if let Some(panel) = app.get_webview_window("panel") {
+        let quoted = serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".into());
+        let _ = panel.eval(&format!(
+            "window.dispatchEvent(new CustomEvent('vb:toast', {{ detail: {quoted} }}))"
+        ));
+    }
+}
+
+// the whole dance: panel session cookie -> mint token -> npx init.
+// NEVER call from the main thread — cookies_for_url round-trips through the event loop.
+fn ensure_agent_connected(app: &AppHandle) -> Result<String, String> {
+    if CONNECTING.swap(true, Ordering::SeqCst) {
+        return Err("already connecting — give it a few seconds".into());
+    }
+    let result = (|| {
+        if machine_wired() {
+            return Ok("this machine is already wired ✓".to_string());
+        }
+        let panel = app.get_webview_window("panel").ok_or("panel not ready yet")?;
+        let url: tauri::Url = SITE.parse().map_err(|e| format!("bad url: {e}"))?;
+        let cookies = panel
+            .cookies_for_url(url)
+            .map_err(|e| format!("could not read session: {e}"))?;
+        let sid = cookies
+            .iter()
+            .find(|c| c.name() == "vb_sid")
+            .map(|c| c.value().to_string())
+            .ok_or("not signed in yet")?;
+        let token = mint_token(&sid)?;
+        run_npx_init(&token, SITE)
+    })();
+    CONNECTING.store(false, Ordering::SeqCst);
+    result
+}
+
+// spawn the CLI with a pre-authorized token — no browser dance, no terminal.
+// with no arguments it self-serves: panel session -> token -> npx (async = off the UI thread).
+#[tauri::command]
+async fn install_agent(app: AppHandle, token: Option<String>, server: Option<String>) -> Result<String, String> {
+    if let (Some(token), Some(server)) = (token, server) {
+        if !token.starts_with("vb_") || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err("bad token".into());
+        }
+        let server_ok = server == "https://vibebuddy.io"
+            || server == "https://staging.vibebuddy.io"
+            || server.starts_with("http://localhost")
+            || server.starts_with("http://127.0.0.1");
+        if !server_ok {
+            return Err("bad server".into());
+        }
+        return run_npx_init(&token, &server);
+    }
+    ensure_agent_connected(&app)
 }
 
 #[tauri::command]
@@ -172,6 +274,7 @@ fn bubble_menu(app: AppHandle) {
                 return;
             };
             let open = MenuItemBuilder::with_id("open", "open / hide panel").build(&app);
+            let connect = MenuItemBuilder::with_id("connect", "connect this machine's agents").build(&app);
             let frosted = CheckMenuItemBuilder::with_id("frosted", "frosted panel")
                 .checked(FROSTED.load(Ordering::Relaxed))
                 .build(&app);
@@ -188,10 +291,10 @@ fn bubble_menu(app: AppHandle) {
             let snap_l = MenuItemBuilder::with_id("snap_left", "snap left").build(&app);
             let snap_r = MenuItemBuilder::with_id("snap_right", "snap right").build(&app);
             let quit = MenuItemBuilder::with_id("quit", "quit vibebuddy").build(&app);
-            if let (Ok(open), Ok(frosted), Ok(snap_l), Ok(snap_r), Ok(quit)) =
-                (open, frosted, snap_l, snap_r, quit)
+            if let (Ok(open), Ok(connect), Ok(frosted), Ok(snap_l), Ok(snap_r), Ok(quit)) =
+                (open, connect, frosted, snap_l, snap_r, quit)
             {
-                let mut b = MenuBuilder::new(&app).item(&open).item(&frosted).separator();
+                let mut b = MenuBuilder::new(&app).item(&open).item(&connect).item(&frosted).separator();
                 for item in &ops {
                     b = b.item(item);
                 }
@@ -238,6 +341,16 @@ fn snap_bubble(app: &AppHandle, side: &str) {
 fn handle_menu(app: &AppHandle, id: &str) {
     match id {
         "open" => toggle_panel(app.clone()),
+        "connect" => {
+            let app = app.clone();
+            std::thread::spawn(move || {
+                panel_toast(&app, "⚡ connecting your coding agents… (~15s)");
+                match ensure_agent_connected(&app) {
+                    Ok(msg) => panel_toast(&app, &format!("✓ {msg}")),
+                    Err(e) => panel_toast(&app, &format!("connect failed: {e} — fallback: npx vibebuddy init")),
+                }
+            });
+        }
         "frosted" => {
             let now = !FROSTED.load(Ordering::Relaxed);
             FROSTED.store(now, Ordering::Relaxed);
@@ -371,6 +484,33 @@ pub fn run() {
                     let _ = panel_for_event.hide();
                 }
             });
+
+            // startup auto-connect: if this machine isn't wired and the panel already
+            // carries a signed-in session, wire it silently — connection IS the gameplay.
+            {
+                let app = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(6));
+                    for _ in 0..24 {
+                        if machine_wired() {
+                            return;
+                        }
+                        match ensure_agent_connected(&app) {
+                            Ok(msg) => {
+                                panel_toast(&app, &format!("✓ {msg}"));
+                                return;
+                            }
+                            // not signed in yet: keep waiting — the web app re-triggers after sign-in
+                            Err(e) if e.contains("not signed in") || e.contains("already connecting") => {}
+                            Err(e) => {
+                                panel_toast(&app, &format!("agent connect failed: {e} — fallback: npx vibebuddy init"));
+                                return;
+                            }
+                        }
+                        std::thread::sleep(Duration::from_secs(10));
+                    }
+                });
+            }
 
             // ---- tray ----
             let open_item = MenuItemBuilder::with_id("open", "open / hide panel").build(app)?;
