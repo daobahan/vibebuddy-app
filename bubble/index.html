@@ -24,25 +24,28 @@
     <canvas id="pet" width="64" height="64"></canvas>
   </div>
   <script>
-    // the brand mark, not anybody's pet — an egg is an invitation, not an identity
+    // the brand mark v2 — a speech bubble holding a heart. the app, not anybody's pet.
     function drawMark() {
       const g = Array.from({ length: 16 }, () => Array(16).fill(null));
       const set = (x, y, c) => { if (x >= 0 && x < 16 && y >= 0 && y < 16) g[y][x] = c; };
-      const shell = '#f2ede2', shade = '#d9d2c2', line = '#26262b', heart = '#d85a30', spark = '#f5c542';
-      const ROWS = [[6,9],[5,10],[4,11],[4,11],[3,12],[3,12],[3,12],[3,12],[4,11],[4,11],[5,10]];
-      ROWS.forEach(([a, b], i) => {
-        const y = 2 + i;
-        for (let x = a; x <= b; x++) set(x, y, x >= b - 1 || i >= 9 ? shade : shell);
+      const body = '#f2ede2', shade = '#d9d2c2', line = '#26262b', heart = '#d85a30', spark = '#f5c542';
+      const ROWS = { 2: [4, 11], 3: [3, 12], 4: [2, 13], 5: [2, 13], 6: [2, 13], 7: [2, 13], 8: [2, 13], 9: [3, 12], 10: [4, 11] };
+      for (const [yStr, [a, b]] of Object.entries(ROWS)) {
+        const y = Number(yStr);
+        for (let x = a; x <= b; x++) set(x, y, x >= b - 1 || y >= 9 ? shade : body);
         set(a - 1, y, line); set(b + 1, y, line);
-      });
-      for (let x = 6; x <= 9; x++) set(x, 1, line);
-      for (let x = 5; x <= 10; x++) set(x, 13, line);
-      set(5, 2, line); set(10, 2, line); set(4, 12, line); set(11, 12, line);
-      set(6, 6, heart); set(8, 6, heart);
-      for (let x = 5; x <= 9; x++) set(x, 7, heart);
-      for (let x = 6; x <= 8; x++) set(x, 8, heart);
-      set(7, 9, heart);
-      set(13, 2, spark); set(12, 3, spark); set(14, 3, spark); set(13, 4, spark);
+      }
+      for (let x = 4; x <= 11; x++) set(x, 1, line);
+      for (let x = 4; x <= 11; x++) set(x, 11, x === 5 || x === 6 ? shade : line);
+      set(5, 12, line); set(6, 12, shade); set(7, 12, line);
+      set(4, 13, line); set(5, 13, shade); set(6, 13, line);
+      set(4, 14, line); set(5, 14, line);
+      set(5, 4, heart); set(6, 4, heart); set(9, 4, heart); set(10, 4, heart);
+      for (let x = 5; x <= 10; x++) set(x, 5, heart);
+      for (let x = 5; x <= 10; x++) set(x, 6, heart);
+      for (let x = 6; x <= 9; x++) set(x, 7, heart);
+      set(7, 8, heart); set(8, 8, heart);
+      set(13, 1, spark); set(12, 2, spark); set(14, 2, spark); set(13, 3, spark);
       const ctx = document.getElementById('pet').getContext('2d');
       ctx.clearRect(0, 0, 64, 64);
       for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {

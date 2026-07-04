@@ -1,6 +1,6 @@
 // VibeBuddy desktop bubble v0.2.1 — pretty bubble, native context menu,
 // browser-based sign-in handoff, draggable clamped panel, magnetic edges.
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{
@@ -16,6 +16,7 @@ const SNAP_PX: i32 = 48;
 const MARGIN: i32 = 8;
 
 static FROSTED: AtomicBool = AtomicBool::new(true);
+static SOLIDITY: AtomicU32 = AtomicU32::new(86); // panel opaqueness %, adjustable from the bubble menu
 
 fn open_in_system_browser(url: &str) {
     #[cfg(target_os = "windows")]
@@ -69,7 +70,13 @@ fn position_panel(app: &AppHandle) {
         })
         .unwrap_or((0, 0, 1920, 1080));
 
-    let mut x = bpos.x + bsize.width as i32 - pw;
+    // dock toward the bubble's half of the screen so the pair hugs the near edge
+    let bubble_center = bpos.x + bsize.width as i32 / 2;
+    let mut x = if bubble_center < mx + mw / 2 {
+        bpos.x // left half: panel's left edge lines up with the bubble
+    } else {
+        bpos.x + bsize.width as i32 - pw // right half: right edges align
+    };
     // prefer above the bubble; if it would clip the top, go below
     let mut y = bpos.y - ph - gap;
     if y < my + MARGIN {
@@ -78,6 +85,48 @@ fn position_panel(app: &AppHandle) {
     x = x.clamp(mx + MARGIN, (mx + mw - pw - MARGIN).max(mx + MARGIN));
     y = y.clamp(my + MARGIN, (my + mh - ph - MARGIN).max(my + MARGIN));
     let _ = panel.set_position(PhysicalPosition::new(x, y));
+}
+
+// spawn the CLI with a pre-authorized token — no browser dance, no terminal
+#[tauri::command]
+fn install_agent(token: String, server: String) -> Result<String, String> {
+    if !token.starts_with("vb_") || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("bad token".into());
+    }
+    let server_ok = server == "https://vibebuddy.io"
+        || server == "https://staging.vibebuddy.io"
+        || server.starts_with("http://localhost")
+        || server.starts_with("http://127.0.0.1");
+    if !server_ok {
+        return Err("bad server".into());
+    }
+    let output = {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            std::process::Command::new("cmd")
+                .args(["/C", "npx", "-y", "vibebuddy@latest", "init", "--token", &token, "--server", &server])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .output()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::process::Command::new("sh")
+                .args(["-lc", &format!("npx -y vibebuddy@latest init --token {token} --server {server}")])
+                .output()
+        }
+    }
+    .map_err(|e| format!("could not run npx: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.status.success() {
+        Ok(text.lines().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" "))
+    } else {
+        Err(text.chars().take(400).collect())
+    }
 }
 
 #[tauri::command]
@@ -126,15 +175,27 @@ fn bubble_menu(app: AppHandle) {
             let frosted = CheckMenuItemBuilder::with_id("frosted", "frosted panel")
                 .checked(FROSTED.load(Ordering::Relaxed))
                 .build(&app);
+            let cur = SOLIDITY.load(Ordering::Relaxed);
+            let mut ops = Vec::new();
+            for v in [100u32, 90, 80, 70] {
+                if let Ok(item) = CheckMenuItemBuilder::with_id(format!("solid_{v}"), format!("panel opacity {v}%"))
+                    .checked(cur == v || (v == 90 && cur == 86))
+                    .build(&app)
+                {
+                    ops.push(item);
+                }
+            }
             let snap_l = MenuItemBuilder::with_id("snap_left", "snap left").build(&app);
             let snap_r = MenuItemBuilder::with_id("snap_right", "snap right").build(&app);
             let quit = MenuItemBuilder::with_id("quit", "quit vibebuddy").build(&app);
             if let (Ok(open), Ok(frosted), Ok(snap_l), Ok(snap_r), Ok(quit)) =
                 (open, frosted, snap_l, snap_r, quit)
             {
-                if let Ok(menu) = MenuBuilder::new(&app)
-                    .item(&open)
-                    .item(&frosted)
+                let mut b = MenuBuilder::new(&app).item(&open).item(&frosted).separator();
+                for item in &ops {
+                    b = b.item(item);
+                }
+                if let Ok(menu) = b
                     .separator()
                     .item(&snap_l)
                     .item(&snap_r)
@@ -187,6 +248,16 @@ fn handle_menu(app: &AppHandle, id: &str) {
         "snap_left" => snap_bubble(app, "left"),
         "snap_right" => snap_bubble(app, "right"),
         "quit" => app.exit(0),
+        id if id.starts_with("solid_") => {
+            if let Ok(v) = id.trim_start_matches("solid_").parse::<u32>() {
+                SOLIDITY.store(v, Ordering::Relaxed);
+                if let Some(panel) = app.get_webview_window("panel") {
+                    let _ = panel.eval(&format!(
+                        "try{{localStorage.setItem('vb:solid','{v}');document.documentElement.style.setProperty('--panel-solid','{v}%');}}catch(e){{}}"
+                    ));
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -194,7 +265,7 @@ fn handle_menu(app: &AppHandle, id: &str) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![toggle_panel, quit_app, bubble_menu, get_account])
+        .invoke_handler(tauri::generate_handler![toggle_panel, quit_app, bubble_menu, get_account, install_agent])
         .on_menu_event(|app, event| handle_menu(app, event.id().as_ref()))
         .setup(|app| {
             // ---- the bubble ----
@@ -250,6 +321,13 @@ pub fn run() {
                         y = y.clamp(mp.y + MARGIN, mp.y + ms.height as i32 - h - MARGIN);
                         if x != pos.x || y != pos.y {
                             let _ = bubble.set_position(PhysicalPosition::new(x, y));
+                        }
+                        // the panel is the bubble's shadow — wherever it settles, follow
+                        let app = bubble.app_handle();
+                        if let Some(panel) = app.get_webview_window("panel") {
+                            if panel.is_visible().unwrap_or(false) {
+                                position_panel(app);
+                            }
                         }
                     });
                 }
