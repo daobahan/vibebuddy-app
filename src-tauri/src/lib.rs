@@ -184,15 +184,35 @@ fn panel_toast(app: &AppHandle, msg: &str) {
     }
 }
 
+fn config_token_server() -> Option<(String, String)> {
+    let s = std::fs::read_to_string(vb_config_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    Some((
+        v.get("token")?.as_str()?.to_string(),
+        v.get("server")?.as_str()?.to_string(),
+    ))
+}
+
 // the whole dance: panel session cookie -> mint token -> npx init.
+// force = explicit user ask: rerun init even when wired (picks up newly installed
+// agents like a fresh codex, and refreshes hook templates after CLI updates).
 // NEVER call from the main thread — cookies_for_url round-trips through the event loop.
-fn ensure_agent_connected(app: &AppHandle) -> Result<String, String> {
+fn ensure_agent_connected(app: &AppHandle, force: bool) -> Result<String, String> {
     if CONNECTING.swap(true, Ordering::SeqCst) {
         return Err("already connecting — give it a few seconds".into());
     }
     let result = (|| {
         if machine_wired() {
-            return Ok("this machine is already wired ✓".to_string());
+            if !force {
+                return Ok("this machine is already wired ✓".to_string());
+            }
+            if let Some((token, server)) = config_token_server() {
+                match run_npx_init(&token, &server) {
+                    Ok(m) => return Ok(m),
+                    Err(e) if e.contains("not accepted") => {} // stale token — fall through and re-mint
+                    Err(e) => return Err(e),
+                }
+            }
         }
         let panel = app.get_webview_window("panel").ok_or("panel not ready yet")?;
         let url: tauri::Url = SITE.parse().map_err(|e| format!("bad url: {e}"))?;
@@ -214,7 +234,12 @@ fn ensure_agent_connected(app: &AppHandle) -> Result<String, String> {
 // spawn the CLI with a pre-authorized token — no browser dance, no terminal.
 // with no arguments it self-serves: panel session -> token -> npx (async = off the UI thread).
 #[tauri::command]
-async fn install_agent(app: AppHandle, token: Option<String>, server: Option<String>) -> Result<String, String> {
+async fn install_agent(
+    app: AppHandle,
+    token: Option<String>,
+    server: Option<String>,
+    force: Option<bool>,
+) -> Result<String, String> {
     if let (Some(token), Some(server)) = (token, server) {
         if !token.starts_with("vb_") || !token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err("bad token".into());
@@ -228,7 +253,7 @@ async fn install_agent(app: AppHandle, token: Option<String>, server: Option<Str
         }
         return run_npx_init(&token, &server);
     }
-    ensure_agent_connected(&app)
+    ensure_agent_connected(&app, force.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -345,7 +370,7 @@ fn handle_menu(app: &AppHandle, id: &str) {
             let app = app.clone();
             std::thread::spawn(move || {
                 panel_toast(&app, "⚡ connecting your coding agents… (~15s)");
-                match ensure_agent_connected(&app) {
+                match ensure_agent_connected(&app, true) {
                     Ok(msg) => panel_toast(&app, &format!("✓ {msg}")),
                     Err(e) => panel_toast(&app, &format!("connect failed: {e} — fallback: npx vibebuddy init")),
                 }
@@ -495,7 +520,7 @@ pub fn run() {
                         if machine_wired() {
                             return;
                         }
-                        match ensure_agent_connected(&app) {
+                        match ensure_agent_connected(&app, false) {
                             Ok(msg) => {
                                 panel_toast(&app, &format!("✓ {msg}"));
                                 return;
