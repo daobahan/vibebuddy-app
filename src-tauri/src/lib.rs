@@ -205,6 +205,92 @@ fn codex_unwired() -> bool {
     }
 }
 
+fn home_dir() -> String {
+    std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default()
+}
+
+// `claude mcp add` fails silently when the claude CLI is not on the GUI PATH —
+// write the user-scope registration into ~/.claude.json ourselves (same shape).
+fn ensure_claude_mcp() -> bool {
+    let home = home_dir();
+    let mcp_path = std::path::Path::new(&home).join(".vibebuddy").join("mcp.mjs");
+    if !mcp_path.exists() {
+        return false;
+    }
+    let cj = std::path::Path::new(&home).join(".claude.json");
+    let Ok(s) = std::fs::read_to_string(&cj) else {
+        return false; // no claude on this box — nothing to register
+    };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return false; // never clobber a file we cannot parse
+    };
+    let Some(root) = v.as_object_mut() else { return false };
+    let servers = root
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(servers) = servers.as_object_mut() else { return false };
+    if servers.contains_key("vibebuddy") {
+        return true;
+    }
+    servers.insert(
+        "vibebuddy".into(),
+        serde_json::json!({
+            "type": "stdio",
+            "command": "node",
+            "args": [mcp_path.to_string_lossy().replace('\\', "/")],
+            "env": { "VB_AGENT_KIND": "claude-code" }
+        }),
+    );
+    std::fs::write(&cj, serde_json::to_string_pretty(&v).unwrap_or(s)).is_ok()
+}
+
+// the app is the sensor: codex desktop runs as Codex.exe — if it's alive, say so.
+// no config handshakes, no restart timing, just an honest process check.
+fn codex_running() -> bool {
+    let mut c = std::process::Command::new("tasklist");
+    c.args(["/FI", "IMAGENAME eq Codex.exe", "/NH"]);
+    no_window(&mut c);
+    match c.output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_lowercase().contains("codex.exe"),
+        Err(_) => false,
+    }
+}
+
+fn post_agent_event(token: &str, server: &str, body: &str) {
+    let mut c = std::process::Command::new("curl");
+    c.args(["-s", "-m", "10", "-X", "POST", "-H", "Content-Type: application/json"]);
+    c.arg("-H").arg(format!("Authorization: Bearer {token}"));
+    c.args(["-d", body]);
+    c.arg(format!("{server}/api/agent/event"));
+    no_window(&mut c);
+    let _ = c.output();
+}
+
+// one glance = the whole wiring story (me tab renders this as a checklist)
+#[tauri::command]
+fn connection_report() -> serde_json::Value {
+    let home = home_dir();
+    let nest = std::path::Path::new(&home).join(".vibebuddy").join("config.json").exists();
+    let hooks = std::fs::read_to_string(std::path::Path::new(&home).join(".claude").join("settings.json"))
+        .map(|s| s.matches("hook.mjs").count())
+        .unwrap_or(0);
+    let claude_mcp = std::fs::read_to_string(std::path::Path::new(&home).join(".claude.json"))
+        .map(|s| s.contains("\"vibebuddy\""))
+        .unwrap_or(false);
+    let codex_cfg = std::fs::read_to_string(std::path::Path::new(&home).join(".codex").join("config.toml"))
+        .map(|s| s.contains("[mcp_servers.vibebuddy]"))
+        .unwrap_or(false);
+    serde_json::json!({
+        "nest": nest,
+        "claude_hooks": hooks,
+        "claude_mcp": claude_mcp,
+        "codex_bridge": codex_cfg,
+        "codex_running": codex_running(),
+    })
+}
+
 // the whole dance: panel session cookie -> mint token -> npx init.
 // force = explicit user ask: rerun init even when wired (picks up newly installed
 // agents like a fresh codex, and refreshes hook templates after CLI updates).
@@ -220,7 +306,10 @@ fn ensure_agent_connected(app: &AppHandle, force: bool) -> Result<String, String
             }
             if let Some((token, server)) = config_token_server() {
                 match run_npx_init(&token, &server) {
-                    Ok(m) => return Ok(m),
+                    Ok(_) => {
+                        ensure_claude_mcp();
+                        return Ok("re-wired — hooks & bridges refreshed ✓".into());
+                    }
                     Err(e) if e.contains("not accepted") => {} // stale token — fall through and re-mint
                     Err(e) => return Err(e),
                 }
@@ -237,7 +326,9 @@ fn ensure_agent_connected(app: &AppHandle, force: bool) -> Result<String, String
             .map(|c| c.value().to_string())
             .ok_or("not signed in yet")?;
         let token = mint_token(&sid)?;
-        run_npx_init(&token, SITE)
+        let out = run_npx_init(&token, SITE);
+        ensure_claude_mcp(); // the CLI's `claude mcp add` can miss on GUI PATH — belt it
+        out
     })();
     CONNECTING.store(false, Ordering::SeqCst);
     result
@@ -415,7 +506,7 @@ fn handle_menu(app: &AppHandle, id: &str) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![toggle_panel, quit_app, bubble_menu, get_account, install_agent])
+        .invoke_handler(tauri::generate_handler![toggle_panel, quit_app, bubble_menu, get_account, install_agent, connection_report])
         .on_menu_event(|app, event| handle_menu(app, event.id().as_ref()))
         .setup(|app| {
             // ---- the bubble ----
@@ -522,17 +613,35 @@ pub fn run() {
                 }
             });
 
+            // the codex sensor: while codex desktop is alive, its lane stays online —
+            // pure process detection, no config handshakes, no restart timing
+            std::thread::spawn(move || loop {
+                if let Some((token, server)) = config_token_server() {
+                    if codex_running() {
+                        post_agent_event(
+                            &token,
+                            &server,
+                            r#"{"type":"app_open","agent_kind":"codex","session_id":"codex-app"}"#,
+                        );
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(45));
+            });
+
             // startup auto-connect: if this machine isn't wired and the panel already
             // carries a signed-in session, wire it silently — connection IS the gameplay.
             {
                 let app = app.handle().clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(Duration::from_secs(6));
+                    if machine_wired() {
+                        ensure_claude_mcp(); // self-heal the registration every launch
+                    }
                     // wired machine, late-arriving codex: one silent re-init writes its MCP bridge
                     if machine_wired() && codex_unwired() {
                         if let Some((token, server)) = config_token_server() {
                             if run_npx_init(&token, &server).is_ok() {
-                                panel_toast(&app, "✓ codex wired up — restart codex and it counts");
+                                panel_toast(&app, "✓ codex wired up — it counts from its next launch");
                             }
                         }
                     }

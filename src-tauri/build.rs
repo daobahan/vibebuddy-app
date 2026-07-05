@@ -9,6 +9,7 @@ fn main() {
                 "bubble_menu",
                 "get_account",
                 "install_agent",
+                "connection_report",
             ]),
         ),
     )
