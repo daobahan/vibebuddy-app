@@ -711,53 +711,55 @@ pub fn run() {
                         watcher = spawn_watcher();
                     }
                     if let Some((token, server)) = config_token_server() {
-                        // ---- codex presence (work signals live in the watcher) ----
+                        // ---- codex presence, 5s ticks (work signals live in the watcher) ----
                         let codex_now = codex_running();
                         if codex_now {
                             codex_missing_ticks = 0;
-                            if !codex_prev || tick % 2 == 0 {
+                            if !codex_prev || tick % 8 == 0 {
                                 post_agent_event(&token, &server, r#"{"type":"app_open","agent_kind":"codex","session_id":"codex-app"}"#);
                             }
                             codex_prev = true;
                         } else if codex_prev {
                             codex_missing_ticks += 1;
                             if codex_missing_ticks >= 2 {
-                                // seen dead twice — clear every codex lane, bridge leftovers included
+                                // seen dead twice (~10s) — clear every codex lane, bridge leftovers included
                                 post_agent_event(&token, &server, r#"{"type":"app_closed","agent_kind":"codex"}"#);
                                 codex_prev = false;
                                 codex_missing_ticks = 0;
                             }
                         }
 
-                        // ---- claude ----
-                        let claude_now = claude_running();
-                        if claude_now {
-                            claude_missing_ticks = 0;
-                            let working = claude_working_evidence();
-                            if working {
-                                post_agent_event(&token, &server, r#"{"type":"heartbeat","agent_kind":"claude-code","session_id":"claude-app","sensed":true}"#);
-                            } else {
-                                if claude_was_working {
-                                    post_agent_event(&token, &server, r#"{"type":"session_end","agent_kind":"claude-code","session_id":"claude-app"}"#);
-                                }
-                                if !claude_prev || tick % 2 == 0 {
-                                    post_agent_event(&token, &server, r#"{"type":"app_open","agent_kind":"claude-code","session_id":"claude-app"}"#);
-                                }
-                            }
-                            claude_was_working = working;
-                            claude_prev = true;
-                        } else if claude_prev {
-                            claude_missing_ticks += 1;
-                            if claude_missing_ticks >= 2 {
-                                post_agent_event(&token, &server, r#"{"type":"app_closed","agent_kind":"claude-code"}"#);
-                                claude_prev = false;
+                        // ---- claude: the CIM probe is heavier, every other tick (10s) ----
+                        if tick % 2 == 0 {
+                            let claude_now = claude_running();
+                            if claude_now {
                                 claude_missing_ticks = 0;
-                                claude_was_working = false;
+                                let working = claude_working_evidence();
+                                if working {
+                                    post_agent_event(&token, &server, r#"{"type":"heartbeat","agent_kind":"claude-code","session_id":"claude-app","sensed":true}"#);
+                                } else {
+                                    if claude_was_working {
+                                        post_agent_event(&token, &server, r#"{"type":"session_end","agent_kind":"claude-code","session_id":"claude-app"}"#);
+                                    }
+                                    if !claude_prev || tick % 8 == 0 {
+                                        post_agent_event(&token, &server, r#"{"type":"app_open","agent_kind":"claude-code","session_id":"claude-app"}"#);
+                                    }
+                                }
+                                claude_was_working = working;
+                                claude_prev = true;
+                            } else if claude_prev {
+                                claude_missing_ticks += 1;
+                                if claude_missing_ticks >= 2 {
+                                    post_agent_event(&token, &server, r#"{"type":"app_closed","agent_kind":"claude-code"}"#);
+                                    claude_prev = false;
+                                    claude_missing_ticks = 0;
+                                    claude_was_working = false;
+                                }
                             }
                         }
                     }
                     tick += 1;
-                    std::thread::sleep(Duration::from_secs(20));
+                    std::thread::sleep(Duration::from_secs(5));
                 }
             });
 
