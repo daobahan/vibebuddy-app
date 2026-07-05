@@ -258,57 +258,44 @@ fn codex_running() -> bool {
     }
 }
 
-// claude code has no exe of its own — it lives in node processes whose command
-// line says so. active investigation, not waiting for hooks to feel like firing.
-fn claude_running() -> bool {
+// claude code has no exe of its own — it lives in node processes. match ONLY real
+// claude-code hosts (package paths), not anything with 'claude' in a filename.
+fn claude_matches() -> Vec<String> {
     let mut c = std::process::Command::new("powershell");
     c.args([
         "-NoProfile",
         "-Command",
-        "(Get-CimInstance Win32_Process -Filter \"name='node.exe'\" | Where-Object { $_.CommandLine -like '*claude*' -or $_.CommandLine -like '*anthropic*' }).Count",
+        "Get-CimInstance Win32_Process -Filter \"name='node.exe'\" | Where-Object { $_.CommandLine -match '@anthropic-ai|@zed-industries[\\\\/]claude|claude-code' } | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine.Substring(0, [Math]::Min(90, $_.CommandLine.Length)))\" }",
     ]);
     no_window(&mut c);
     match c.output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().map(|n| n > 0).unwrap_or(false),
-        Err(_) => false,
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .take(6)
+            .map(|l| l.trim().to_string())
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }
 
-fn codex_index_mtime() -> u128 {
-    let p = std::path::Path::new(&home_dir()).join(".codex").join("session_index.jsonl");
-    std::fs::metadata(p)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+fn claude_running() -> bool {
+    !claude_matches().is_empty()
 }
 
-// codex rollout logs live under ~/.codex/sessions/yyyy/mm/dd/ — walk the newest
-// leaves only; fresh writes there mean a turn is in flight right now
-fn codex_sessions_fresh(within_s: u64) -> bool {
-    fn newest_child(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-        std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).max()
+// codex work signals (turn completion -> seed, in-flight -> working) live in the
+// node watcher (~/.vibebuddy/watcher.mjs) — it reads codex's own sqlite and, where
+// the platform allows, the official app-server event stream. the shell just keeps
+// exactly one watcher alive.
+fn spawn_watcher() -> Option<std::process::Child> {
+    let w = std::path::Path::new(&home_dir()).join(".vibebuddy").join("watcher.mjs");
+    if !w.exists() {
+        return None;
     }
-    let mut dir = std::path::Path::new(&home_dir()).join(".codex").join("sessions");
-    for _ in 0..3 {
-        match newest_child(&dir) {
-            Some(d) => dir = d,
-            None => break,
-        }
-    }
-    let Ok(files) = std::fs::read_dir(&dir) else { return false };
-    let now = std::time::SystemTime::now();
-    for f in files.flatten() {
-        if let Ok(md) = f.metadata() {
-            if let Ok(mt) = md.modified() {
-                if now.duration_since(mt).map(|d| d.as_secs() < within_s).unwrap_or(false) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    let mut c = std::process::Command::new("node");
+    c.arg(w);
+    no_window(&mut c);
+    c.spawn().ok()
 }
 
 // hard evidence of a live run: a session log under ~/.claude/projects touched
@@ -360,13 +347,22 @@ fn connection_report() -> serde_json::Value {
     let codex_cfg = std::fs::read_to_string(std::path::Path::new(&home).join(".codex").join("config.toml"))
         .map(|s| s.contains("[mcp_servers.vibebuddy]"))
         .unwrap_or(false);
+    let matches = claude_matches();
+    let watcher: serde_json::Value = std::fs::read_to_string(
+        std::path::Path::new(&home).join(".vibebuddy").join("watcher.json"),
+    )
+    .ok()
+    .and_then(|s| serde_json::from_str(&s).ok())
+    .unwrap_or(serde_json::Value::Null);
     serde_json::json!({
         "nest": nest,
         "claude_hooks": hooks,
         "claude_mcp": claude_mcp,
         "codex_bridge": codex_cfg,
         "codex_running": codex_running(),
-        "claude_running": claude_running(),
+        "claude_running": !matches.is_empty(),
+        "claude_matches": matches,
+        "watcher": watcher,
     })
 }
 
@@ -703,24 +699,24 @@ pub fn run() {
                 let mut claude_prev = false;
                 let mut codex_missing_ticks = 0u32;
                 let mut claude_missing_ticks = 0u32;
-                let mut last_idx = codex_index_mtime();
                 let mut tick = 0u64;
+                let mut watcher = spawn_watcher();
                 loop {
+                    // exactly one watcher, resurrected if it ever dies (or appears post-init)
+                    let dead = match watcher.as_mut() {
+                        Some(w) => w.try_wait().map(|s| s.is_some()).unwrap_or(true),
+                        None => true,
+                    };
+                    if dead {
+                        watcher = spawn_watcher();
+                    }
                     if let Some((token, server)) = config_token_server() {
-                        // ---- codex ----
+                        // ---- codex presence (work signals live in the watcher) ----
                         let codex_now = codex_running();
                         if codex_now {
                             codex_missing_ticks = 0;
                             if !codex_prev || tick % 2 == 0 {
                                 post_agent_event(&token, &server, r#"{"type":"app_open","agent_kind":"codex","session_id":"codex-app"}"#);
-                            }
-                            let idx = codex_index_mtime();
-                            if idx > last_idx {
-                                last_idx = idx; // a turn just finished: blink green, ring the bell, drop the seed
-                                post_agent_event(&token, &server, r#"{"type":"heartbeat","agent_kind":"codex","session_id":"codex-app","sensed":true}"#);
-                                post_agent_event(&token, &server, r#"{"type":"stop","agent_kind":"codex","session_id":"codex-app"}"#);
-                            } else if codex_sessions_fresh(90) {
-                                post_agent_event(&token, &server, r#"{"type":"heartbeat","agent_kind":"codex","session_id":"codex-app","sensed":true}"#);
                             }
                             codex_prev = true;
                         } else if codex_prev {
