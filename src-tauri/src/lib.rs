@@ -274,6 +274,43 @@ fn claude_running() -> bool {
     }
 }
 
+fn codex_index_mtime() -> u128 {
+    let p = std::path::Path::new(&home_dir()).join(".codex").join("session_index.jsonl");
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+// codex rollout logs live under ~/.codex/sessions/yyyy/mm/dd/ — walk the newest
+// leaves only; fresh writes there mean a turn is in flight right now
+fn codex_sessions_fresh(within_s: u64) -> bool {
+    fn newest_child(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_dir()).max()
+    }
+    let mut dir = std::path::Path::new(&home_dir()).join(".codex").join("sessions");
+    for _ in 0..3 {
+        match newest_child(&dir) {
+            Some(d) => dir = d,
+            None => break,
+        }
+    }
+    let Ok(files) = std::fs::read_dir(&dir) else { return false };
+    let now = std::time::SystemTime::now();
+    for f in files.flatten() {
+        if let Ok(md) = f.metadata() {
+            if let Ok(mt) = md.modified() {
+                if now.duration_since(mt).map(|d| d.as_secs() < within_s).unwrap_or(false) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 // hard evidence of a live run: a session log under ~/.claude/projects touched
 // in the last 90s — works even when the hook pipeline is having a bad day
 fn claude_working_evidence() -> bool {
@@ -655,50 +692,76 @@ pub fn run() {
                 }
             });
 
-            // the agent sensor: actively investigate BOTH agents every tick, from the
-            // very first tick — presence must never wait for a hook to feel like firing
+            // the agent sensor: the shell OWNS agent detection — open, closed, and (for
+            // codex) finished work. every 20s, transitions fire immediately:
+            //   appears  -> app_open now          gone (2 ticks) -> app_closed wipes every lane
+            //   codex session_index.jsonl moved -> sensed working + stop = seed + done-bell
+            //   codex sessions tree fresh       -> sensed working (best-effort mid-turn green)
             std::thread::spawn(move || {
                 let mut claude_was_working = false;
+                let mut codex_prev = false;
+                let mut claude_prev = false;
+                let mut codex_missing_ticks = 0u32;
+                let mut claude_missing_ticks = 0u32;
+                let mut last_idx = codex_index_mtime();
+                let mut tick = 0u64;
                 loop {
                     if let Some((token, server)) = config_token_server() {
-                        if codex_running() {
-                            post_agent_event(
-                                &token,
-                                &server,
-                                r#"{"type":"app_open","agent_kind":"codex","session_id":"codex-app"}"#,
-                            );
+                        // ---- codex ----
+                        let codex_now = codex_running();
+                        if codex_now {
+                            codex_missing_ticks = 0;
+                            if !codex_prev || tick % 2 == 0 {
+                                post_agent_event(&token, &server, r#"{"type":"app_open","agent_kind":"codex","session_id":"codex-app"}"#);
+                            }
+                            let idx = codex_index_mtime();
+                            if idx > last_idx {
+                                last_idx = idx; // a turn just finished: blink green, ring the bell, drop the seed
+                                post_agent_event(&token, &server, r#"{"type":"heartbeat","agent_kind":"codex","session_id":"codex-app","sensed":true}"#);
+                                post_agent_event(&token, &server, r#"{"type":"stop","agent_kind":"codex","session_id":"codex-app"}"#);
+                            } else if codex_sessions_fresh(90) {
+                                post_agent_event(&token, &server, r#"{"type":"heartbeat","agent_kind":"codex","session_id":"codex-app","sensed":true}"#);
+                            }
+                            codex_prev = true;
+                        } else if codex_prev {
+                            codex_missing_ticks += 1;
+                            if codex_missing_ticks >= 2 {
+                                // seen dead twice — clear every codex lane, bridge leftovers included
+                                post_agent_event(&token, &server, r#"{"type":"app_closed","agent_kind":"codex"}"#);
+                                codex_prev = false;
+                                codex_missing_ticks = 0;
+                            }
                         }
-                        if claude_running() {
+
+                        // ---- claude ----
+                        let claude_now = claude_running();
+                        if claude_now {
+                            claude_missing_ticks = 0;
                             let working = claude_working_evidence();
                             if working {
-                                // sensed:true → the server shows it live but never double-counts hours
-                                post_agent_event(
-                                    &token,
-                                    &server,
-                                    r#"{"type":"heartbeat","agent_kind":"claude-code","session_id":"claude-app","sensed":true}"#,
-                                );
+                                post_agent_event(&token, &server, r#"{"type":"heartbeat","agent_kind":"claude-code","session_id":"claude-app","sensed":true}"#);
                             } else {
                                 if claude_was_working {
-                                    // the run clearly ended — retire the sensed lane instead of
-                                    // letting a stale "working" linger (no seeds from session_end)
-                                    post_agent_event(
-                                        &token,
-                                        &server,
-                                        r#"{"type":"session_end","agent_kind":"claude-code","session_id":"claude-app"}"#,
-                                    );
+                                    post_agent_event(&token, &server, r#"{"type":"session_end","agent_kind":"claude-code","session_id":"claude-app"}"#);
                                 }
-                                post_agent_event(
-                                    &token,
-                                    &server,
-                                    r#"{"type":"app_open","agent_kind":"claude-code","session_id":"claude-app"}"#,
-                                );
+                                if !claude_prev || tick % 2 == 0 {
+                                    post_agent_event(&token, &server, r#"{"type":"app_open","agent_kind":"claude-code","session_id":"claude-app"}"#);
+                                }
                             }
                             claude_was_working = working;
-                        } else {
-                            claude_was_working = false;
+                            claude_prev = true;
+                        } else if claude_prev {
+                            claude_missing_ticks += 1;
+                            if claude_missing_ticks >= 2 {
+                                post_agent_event(&token, &server, r#"{"type":"app_closed","agent_kind":"claude-code"}"#);
+                                claude_prev = false;
+                                claude_missing_ticks = 0;
+                                claude_was_working = false;
+                            }
                         }
                     }
-                    std::thread::sleep(Duration::from_secs(40));
+                    tick += 1;
+                    std::thread::sleep(Duration::from_secs(20));
                 }
             });
 
