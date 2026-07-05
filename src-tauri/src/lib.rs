@@ -9,8 +9,8 @@ use tauri::{
     AppHandle, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
-const PANEL_W: f64 = 400.0;
-const PANEL_H: f64 = 640.0;
+const PANEL_W: f64 = 440.0;
+const PANEL_H: f64 = 760.0;
 const SITE: &str = "https://vibebuddy.io";
 const SNAP_PX: i32 = 48;
 const MARGIN: i32 = 8;
@@ -483,9 +483,9 @@ fn bubble_menu(app: AppHandle) {
                 .build(&app);
             let cur = SOLIDITY.load(Ordering::Relaxed);
             let mut ops = Vec::new();
-            for v in [100u32, 90, 80, 70] {
+            for v in [100u32, 80, 60, 40, 20] {
                 if let Ok(item) = CheckMenuItemBuilder::with_id(format!("solid_{v}"), format!("panel opacity {v}%"))
-                    .checked(cur == v || (v == 90 && cur == 86))
+                    .checked(cur == v || (v == 80 && cur == 86))
                     .build(&app)
                 {
                     ops.push(item);
