@@ -258,6 +258,47 @@ fn codex_running() -> bool {
     }
 }
 
+// claude code has no exe of its own — it lives in node processes whose command
+// line says so. active investigation, not waiting for hooks to feel like firing.
+fn claude_running() -> bool {
+    let mut c = std::process::Command::new("powershell");
+    c.args([
+        "-NoProfile",
+        "-Command",
+        "(Get-CimInstance Win32_Process -Filter \"name='node.exe'\" | Where-Object { $_.CommandLine -like '*claude*' -or $_.CommandLine -like '*anthropic*' }).Count",
+    ]);
+    no_window(&mut c);
+    match c.output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().map(|n| n > 0).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+// hard evidence of a live run: a session log under ~/.claude/projects touched
+// in the last 90s — works even when the hook pipeline is having a bad day
+fn claude_working_evidence() -> bool {
+    let root = std::path::Path::new(&home_dir()).join(".claude").join("projects");
+    let Ok(dirs) = std::fs::read_dir(&root) else { return false };
+    let now = std::time::SystemTime::now();
+    for d in dirs.flatten() {
+        let Ok(files) = std::fs::read_dir(d.path()) else { continue };
+        for f in files.flatten() {
+            let p = f.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Ok(md) = f.metadata() {
+                if let Ok(mt) = md.modified() {
+                    if now.duration_since(mt).map(|dt| dt.as_secs() < 90).unwrap_or(false) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn post_agent_event(token: &str, server: &str, body: &str) {
     let mut c = std::process::Command::new("curl");
     c.args(["-s", "-m", "10", "-X", "POST", "-H", "Content-Type: application/json"]);
@@ -288,6 +329,7 @@ fn connection_report() -> serde_json::Value {
         "claude_mcp": claude_mcp,
         "codex_bridge": codex_cfg,
         "codex_running": codex_running(),
+        "claude_running": claude_running(),
     })
 }
 
@@ -613,19 +655,51 @@ pub fn run() {
                 }
             });
 
-            // the codex sensor: while codex desktop is alive, its lane stays online —
-            // pure process detection, no config handshakes, no restart timing
-            std::thread::spawn(move || loop {
-                if let Some((token, server)) = config_token_server() {
-                    if codex_running() {
-                        post_agent_event(
-                            &token,
-                            &server,
-                            r#"{"type":"app_open","agent_kind":"codex","session_id":"codex-app"}"#,
-                        );
+            // the agent sensor: actively investigate BOTH agents every tick, from the
+            // very first tick — presence must never wait for a hook to feel like firing
+            std::thread::spawn(move || {
+                let mut claude_was_working = false;
+                loop {
+                    if let Some((token, server)) = config_token_server() {
+                        if codex_running() {
+                            post_agent_event(
+                                &token,
+                                &server,
+                                r#"{"type":"app_open","agent_kind":"codex","session_id":"codex-app"}"#,
+                            );
+                        }
+                        if claude_running() {
+                            let working = claude_working_evidence();
+                            if working {
+                                // sensed:true → the server shows it live but never double-counts hours
+                                post_agent_event(
+                                    &token,
+                                    &server,
+                                    r#"{"type":"heartbeat","agent_kind":"claude-code","session_id":"claude-app","sensed":true}"#,
+                                );
+                            } else {
+                                if claude_was_working {
+                                    // the run clearly ended — retire the sensed lane instead of
+                                    // letting a stale "working" linger (no seeds from session_end)
+                                    post_agent_event(
+                                        &token,
+                                        &server,
+                                        r#"{"type":"session_end","agent_kind":"claude-code","session_id":"claude-app"}"#,
+                                    );
+                                }
+                                post_agent_event(
+                                    &token,
+                                    &server,
+                                    r#"{"type":"app_open","agent_kind":"claude-code","session_id":"claude-app"}"#,
+                                );
+                            }
+                            claude_was_working = working;
+                        } else {
+                            claude_was_working = false;
+                        }
                     }
+                    std::thread::sleep(Duration::from_secs(40));
                 }
-                std::thread::sleep(Duration::from_secs(45));
             });
 
             // startup auto-connect: if this machine isn't wired and the panel already
