@@ -22,6 +22,30 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'VibeBuddy ${{ github.ref_name }}'
-          releaseBody: 'Desktop bubble for Windows. Install: `npx vibebuddy app` — or download the setup below.'
+          releaseBody: 'Desktop bubble. Windows: `npx vibebuddy app` or the setup exe. macOS: dmg below (beta, unsigned — right-click → Open the first time).'
           releaseDraft: false
           prerelease: false
+
+  # macOS: best-effort, unsigned (Gatekeeper wants right-click → Open once).
+  # Shares the same release; tauri-action appends the dmg to it.
+  build-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'VibeBuddy ${{ github.ref_name }}'
+          releaseDraft: false
+          prerelease: false
+          args: --target universal-apple-darwin --bundles dmg
