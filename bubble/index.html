@@ -4,38 +4,76 @@
   <meta charset="utf-8" />
   <style>
     html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+    /* 8-bit vessel: stepped octagon + hard bevels, no smooth curves anywhere */
     #bubble {
       width: 64px; height: 64px; margin: 4px;
-      border-radius: 50%;
-      background: rgba(22, 22, 27, 0.60);
+      background: rgba(20, 19, 29, 0.72);
+      clip-path: polygon(
+        0 8px, 4px 8px, 4px 4px, 8px 4px, 8px 0,
+        calc(100% - 8px) 0, calc(100% - 8px) 4px, calc(100% - 4px) 4px, calc(100% - 4px) 8px, 100% 8px,
+        100% calc(100% - 8px), calc(100% - 4px) calc(100% - 8px), calc(100% - 4px) calc(100% - 4px),
+        calc(100% - 8px) calc(100% - 4px), calc(100% - 8px) 100%,
+        8px 100%, 8px calc(100% - 4px), 4px calc(100% - 4px), 4px calc(100% - 8px), 0 calc(100% - 8px)
+      );
+      box-shadow: inset 0 0 0 2px #5b5482,
+        inset 4px 4px 0 rgba(255, 255, 255, 0.14),
+        inset -4px -4px 0 rgba(0, 0, 0, 0.5);
       display: flex; align-items: center; justify-content: center;
       cursor: pointer; user-select: none;
-      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12), 0 2px 10px rgba(0, 0, 0, 0.25);
-      transition: transform .15s steps(2), background .2s;
+      transition: background .2s steps(2);
     }
-    #bubble:hover { background: rgba(22, 22, 27, 0.78); transform: scale(1.05); }
-    #bubble:active { transform: scale(0.95); }
-    canvas { image-rendering: pixelated; width: 42px; height: 42px; animation: bob 2.4s steps(2) infinite; }
+    #bubble:hover { background: rgba(30, 28, 44, 0.85); }
+    #bubble:active { transform: translate(1px, 1px); }
+    canvas { image-rendering: pixelated; animation: bob 2.4s steps(2) infinite; }
     @keyframes bob { 50% { transform: translateY(-2px); } }
   </style>
 </head>
 <body>
   <div id="bubble" title="vibebuddy — click to open">
-    <canvas id="pet" width="64" height="64"></canvas>
+    <canvas id="pet"></canvas>
   </div>
   <script>
     // the brand mark v4 — the living dot (generated from web/src/brand.js — keep in sync)
-    function drawMark() {
-      const g = [[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],[null,null,null,null,null,null,null,null,null,null,null,null,null,"#f5c542",null,null],[null,null,null,null,null,null,null,null,null,null,null,null,"#f5c542","#fff3c4","#f5c542",null],[null,null,null,null,null,"#63e6a5","#63e6a5","#35d07f","#35d07f","#35d07f","#35d07f",null,null,"#f5c542",null,null],[null,null,null,null,"#63e6a5","#63e6a5","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#1d9e75",null,null,null,null],[null,null,null,"#63e6a5","#63e6a5","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f",null,null,null],[null,null,null,"#35d07f","#35d07f","#dfe8ff","#10131c","#35d07f","#35d07f","#dfe8ff","#10131c","#35d07f","#35d07f",null,null,null],[null,null,null,"#35d07f","#35d07f","#10131c","#10131c","#35d07f","#35d07f","#10131c","#10131c","#35d07f","#35d07f",null,null,null],[null,null,null,"#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f",null,null,null],[null,null,null,"#35d07f","#35d07f","#35d07f","#35d07f","#10131c","#10131c","#35d07f","#35d07f","#35d07f","#1d9e75",null,null,null],[null,null,null,"#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#1d9e75",null,null,null],[null,null,null,null,"#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#1d9e75","#1d9e75",null,null,null,null],[null,null,null,null,null,"#1d9e75","#1d9e75","#1d9e75","#1d9e75","#1d9e75","#1d9e75",null,null,null,null,null],[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null]];
-      const ctx = document.getElementById('pet').getContext('2d');
-      ctx.clearRect(0, 0, 64, 64);
+    const G = [[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],[null,null,null,null,null,null,null,null,null,null,null,null,null,"#f5c542",null,null],[null,null,null,null,null,null,null,null,null,null,null,null,"#f5c542","#fff3c4","#f5c542",null],[null,null,null,null,null,"#63e6a5","#63e6a5","#35d07f","#35d07f","#35d07f","#35d07f",null,null,"#f5c542",null,null],[null,null,null,null,"#63e6a5","#63e6a5","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#1d9e75",null,null,null,null],[null,null,null,"#63e6a5","#63e6a5","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f",null,null,null],[null,null,null,"#35d07f","#35d07f","#dfe8ff","#10131c","#35d07f","#35d07f","#dfe8ff","#10131c","#35d07f","#35d07f",null,null,null],[null,null,null,"#35d07f","#35d07f","#10131c","#10131c","#35d07f","#35d07f","#10131c","#10131c","#35d07f","#35d07f",null,null,null],[null,null,null,"#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f",null,null,null],[null,null,null,"#35d07f","#35d07f","#35d07f","#35d07f","#10131c","#10131c","#35d07f","#35d07f","#35d07f","#1d9e75",null,null,null],[null,null,null,"#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#1d9e75",null,null,null],[null,null,null,null,"#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#35d07f","#1d9e75","#1d9e75",null,null,null,null],[null,null,null,null,null,"#1d9e75","#1d9e75","#1d9e75","#1d9e75","#1d9e75","#1d9e75",null,null,null,null,null],[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null],[null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null]];
+    const cv = document.getElementById('pet');
+    const ctx = cv.getContext('2d');
+    let cell = 3;
+
+    // crisp at every windows scale factor: whole device pixels per grid cell,
+    // canvas backing sized in device px, css size derived back from it
+    function fit() {
+      const dpr = window.devicePixelRatio || 1;
+      cell = Math.max(2, Math.round((44 * dpr) / 16));
+      cv.width = cv.height = 16 * cell;
+      cv.style.width = cv.style.height = (16 * cell) / dpr + 'px';
+      draw(false);
+    }
+
+    function draw(blink) {
+      ctx.clearRect(0, 0, cv.width, cv.height);
       for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
-        if (!g[y][x]) continue;
-        ctx.fillStyle = g[y][x];
-        ctx.fillRect(x * 4, y * 4, 4, 4);
+        let c = G[y][x];
+        if (blink && (y === 6 || y === 7) && (x === 5 || x === 6 || x === 9 || x === 10) && c) {
+          c = y === 7 ? '#1d9e75' : '#35d07f'; // lids down: body over the whites, dark line below
+        }
+        if (!c) continue;
+        ctx.fillStyle = c;
+        ctx.fillRect(x * cell, y * cell, cell, cell);
       }
     }
-    drawMark();
+
+    fit();
+    (function watchDpr() {
+      matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`)
+        .addEventListener('change', () => { fit(); watchDpr(); }, { once: true });
+    })();
+
+    (function blinkLoop() {
+      setTimeout(() => {
+        draw(true);
+        setTimeout(() => { draw(false); blinkLoop(); }, 140);
+      }, 3200 + Math.random() * 2400);
+    })();
 
     // left-click toggles the panel; drag moves the bubble; right-click opens the native menu
     const el = document.getElementById('bubble');

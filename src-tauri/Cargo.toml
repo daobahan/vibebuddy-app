@@ -1,6 +1,6 @@
 [package]
 name = "vibebuddy-app"
-version = "0.5.0"
+version = "0.5.1"
 description = "VibeBuddy desktop bubble — your agent's busy, come hang out."
 edition = "2021"
 license = "MIT"
