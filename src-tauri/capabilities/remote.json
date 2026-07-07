@@ -9,6 +9,10 @@
     "core:window:allow-start-dragging",
     "core:window:allow-hide",
     "allow-install-agent",
-    "allow-connection-report"
+    "allow-connection-report",
+    "allow-app-version",
+    "allow-open-url",
+    "allow-save-image",
+    "allow-update-app"
   ]
 }

@@ -10,6 +10,10 @@ fn main() {
                 "get_account",
                 "install_agent",
                 "connection_report",
+                "app_version",
+                "open_url",
+                "save_image",
+                "update_app",
             ]),
         ),
     )

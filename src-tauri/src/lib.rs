@@ -36,6 +36,123 @@ fn open_in_system_browser(url: &str) {
     }
 }
 
+// std has no base64 — a tiny decoder keeps us dependency-free
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut rev = [255u8; 256];
+    for (i, &c) in T.iter().enumerate() {
+        rev[c as usize] = i as u8;
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut buf = 0u32;
+    let mut n = 0u32;
+    for &b in &bytes {
+        if b == b'=' {
+            break;
+        }
+        let v = rev[b as usize];
+        if v == 255 {
+            return None;
+        }
+        buf = (buf << 6) | v as u32;
+        n += 6;
+        if n >= 8 {
+            n -= 8;
+            out.push((buf >> n) as u8);
+        }
+    }
+    Some(out)
+}
+
+#[tauri::command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+// the panel lives in a webview where window.open goes nowhere — share buttons
+// hand their links here instead
+#[tauri::command]
+fn open_url(url: String) {
+    if url.starts_with("https://") || url.starts_with("http://") {
+        open_in_system_browser(&url);
+    }
+}
+
+// postcard save: the webview has no download UI, so bytes land in Downloads
+#[tauri::command]
+fn save_image(name: String, data_base64: String) -> Result<String, String> {
+    let safe: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    let safe = if safe.is_empty() { "vibebuddy.png".into() } else { safe };
+    let bytes = b64_decode(&data_base64).ok_or("bad image data")?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err("image too large".into());
+    }
+    let dir = std::path::Path::new(&home_dir()).join("Downloads");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(&safe);
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+// one click, new version: download the latest installer, hand off to a detached
+// helper that waits for us to exit, installs silently, and relaunches
+#[tauri::command]
+async fn update_app(app: AppHandle) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut c = std::process::Command::new("curl");
+        c.args(["-s", "-m", "15", &format!("{SITE}/api/app/latest")]);
+        no_window(&mut c);
+        let out = c.output().map_err(|e| e.to_string())?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&out.stdout).map_err(|_| "release feed unreadable".to_string())?;
+        let latest = v["version"].as_str().unwrap_or_default().to_string();
+        let url = v["windows"].as_str().unwrap_or_default().to_string();
+        if latest.is_empty() || url.is_empty() {
+            return Err("release feed incomplete".into());
+        }
+        if latest == env!("CARGO_PKG_VERSION") {
+            return Ok("already current".into());
+        }
+        let setup = std::env::temp_dir().join("vibebuddy-update-setup.exe");
+        let mut dl = std::process::Command::new("curl");
+        dl.args(["-sL", "-m", "300", "-o", &setup.to_string_lossy(), &url]);
+        no_window(&mut dl);
+        let ok = dl.output().map(|o| o.status.success()).unwrap_or(false);
+        if !ok || std::fs::metadata(&setup).map(|m| m.len() < 1_000_000).unwrap_or(true) {
+            return Err("download failed — try again in a minute".into());
+        }
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let script = format!(
+            "timeout /t 2 /nobreak >nul & \"{}\" /S & start \"\" \"{}\"",
+            setup.to_string_lossy(),
+            exe
+        );
+        let mut helper = std::process::Command::new("cmd");
+        helper.args(["/C", &script]);
+        no_window(&mut helper);
+        helper.spawn().map_err(|e| e.to_string())?;
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            app2.exit(0);
+        });
+        Ok(format!("updating to {latest} — back in a moment"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        open_in_system_browser("https://github.com/daobahan/vibebuddy-app/releases/latest");
+        Ok("opened the releases page — drag the new app into place".into())
+    }
+}
+
 fn panel_site_url() -> String {
     if FROSTED.load(Ordering::Relaxed) {
         format!("{SITE}/?translucent=1")
@@ -248,6 +365,7 @@ fn ensure_claude_mcp() -> bool {
 
 // the app is the sensor: codex desktop runs as Codex.exe — if it's alive, say so.
 // no config handshakes, no restart timing, just an honest process check.
+#[cfg(target_os = "windows")]
 fn codex_running() -> bool {
     let mut c = std::process::Command::new("tasklist");
     c.args(["/FI", "IMAGENAME eq Codex.exe", "/NH"]);
@@ -258,8 +376,21 @@ fn codex_running() -> bool {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
+fn codex_running() -> bool {
+    // the Codex desktop app on mac/linux: match the bundle process name
+    let mut c = std::process::Command::new("pgrep");
+    c.args(["-if", "Codex.app|codex"]);
+    no_window(&mut c);
+    match c.output() {
+        Ok(o) => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        Err(_) => false,
+    }
+}
+
 // claude code has no exe of its own — it lives in node processes. match ONLY real
 // claude-code hosts (package paths), not anything with 'claude' in a filename.
+#[cfg(target_os = "windows")]
 fn claude_matches() -> Vec<String> {
     let mut c = std::process::Command::new("powershell");
     c.args([
@@ -274,6 +405,23 @@ fn claude_matches() -> Vec<String> {
             .filter(|l| !l.trim().is_empty())
             .take(6)
             .map(|l| l.trim().to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn claude_matches() -> Vec<String> {
+    // pgrep -fl prints "pid cmdline" — same shape the windows probe produces
+    let mut c = std::process::Command::new("pgrep");
+    c.args(["-fl", "@anthropic-ai|@zed-industries/claude|claude-code"]);
+    no_window(&mut c);
+    match c.output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .take(6)
+            .map(|l| l.chars().take(96).collect::<String>())
             .collect(),
         Err(_) => Vec::new(),
     }
@@ -581,7 +729,18 @@ fn handle_menu(app: &AppHandle, id: &str) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![toggle_panel, quit_app, bubble_menu, get_account, install_agent, connection_report])
+        .invoke_handler(tauri::generate_handler![
+            toggle_panel,
+            quit_app,
+            bubble_menu,
+            get_account,
+            install_agent,
+            connection_report,
+            app_version,
+            open_url,
+            save_image,
+            update_app
+        ])
         .on_menu_event(|app, event| handle_menu(app, event.id().as_ref()))
         .setup(|app| {
             // ---- the bubble ----
