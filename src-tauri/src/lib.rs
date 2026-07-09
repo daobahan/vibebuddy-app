@@ -98,6 +98,24 @@ fn save_image(name: String, data_base64: String) -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+// certutil ships with every windows — hash the download without a crypto crate
+#[cfg(target_os = "windows")]
+fn file_sha256(path: &std::path::Path) -> Option<String> {
+    let mut c = std::process::Command::new("certutil");
+    c.args(["-hashfile", &path.to_string_lossy(), "SHA256"]);
+    no_window(&mut c);
+    let out = c.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // the hex line: 64 hex chars once whitespace goes (old certutil spaced the bytes)
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.split_whitespace().collect::<String>())
+        .find(|l| l.len() == 64 && l.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|l| l.to_lowercase())
+}
+
 // one click, new version: download the latest installer, hand off to a detached
 // helper that waits for us to exit, installs silently, and relaunches
 #[tauri::command]
@@ -125,6 +143,16 @@ async fn update_app(app: AppHandle) -> Result<String, String> {
         let ok = dl.output().map(|o| o.status.success()).unwrap_or(false);
         if !ok || std::fs::metadata(&setup).map(|m| m.len() < 1_000_000).unwrap_or(true) {
             return Err("download failed — try again in a minute".into());
+        }
+        // integrity: verify ONLY when the feed carries the hash (older feeds omit it).
+        // an unhashable file counts as a mismatch — never install what we cannot vouch for.
+        if let Some(want) = v["windows_sha256"].as_str().filter(|s| !s.is_empty()) {
+            let matched = file_sha256(&setup)
+                .is_some_and(|got| got.eq_ignore_ascii_case(want));
+            if !matched {
+                let _ = std::fs::remove_file(&setup);
+                return Err("update failed its integrity check — try again later".into());
+            }
         }
         let exe = std::env::current_exe()
             .map(|p| p.to_string_lossy().to_string())
@@ -471,14 +499,70 @@ fn claude_working_evidence() -> bool {
     false
 }
 
+// no chrono in the tree — civil-from-days by hand keeps the log stamp dependency-free
+fn iso_ts() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if mo <= 2 { 1 } else { 0 };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+// the sensor's black box: every posted event leaves one line in ~/.vibebuddy/sensor.log
+// so 'why is my buddy asleep' is answerable after the fact. fs errors never bite.
+fn sensor_log(body: &str, code: &str) {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("-");
+    let line = format!(
+        "[{}] {} {} {} http:{}\n",
+        iso_ts(),
+        field("type"),
+        field("agent_kind"),
+        field("session_id"),
+        code
+    );
+    let dir = std::path::Path::new(&home_dir()).join(".vibebuddy");
+    let path = dir.join("sensor.log");
+    // rotate before it grows unreadable: >256KB shoves current to .1 (old .1 dies)
+    if std::fs::metadata(&path).map(|m| m.len() > 256 * 1024).unwrap_or(false) {
+        let old = dir.join("sensor.log.1");
+        let _ = std::fs::remove_file(&old); // windows rename refuses to clobber
+        let _ = std::fs::rename(&path, &old);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 fn post_agent_event(token: &str, server: &str, body: &str) {
     let mut c = std::process::Command::new("curl");
     c.args(["-s", "-m", "10", "-X", "POST", "-H", "Content-Type: application/json"]);
     c.arg("-H").arg(format!("Authorization: Bearer {token}"));
     c.args(["-d", body]);
+    // trailing status line so the log records what the server SAID, not just that curl ran
+    c.args(["-w", "\n%{http_code}"]);
     c.arg(format!("{server}/api/agent/event"));
     no_window(&mut c);
-    let _ = c.output();
+    let code = c
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().last().unwrap_or("").trim().to_string())
+        .unwrap_or_default();
+    let code = if code.is_empty() || code == "000" { "err".to_string() } else { code };
+    sensor_log(body, &code);
 }
 
 // one glance = the whole wiring story (me tab renders this as a checklist)
@@ -821,6 +905,7 @@ pub fn run() {
             .shadow(false)
             .always_on_top(true)
             .skip_taskbar(true)
+            .resizable(false) // mirrors the bubble — kills win11 dwm corner rounding + system edge
             .visible(false)
             .initialization_script("window.__VB_DESKTOP__ = true;")
             .on_navigation(|url| {
